@@ -1,6 +1,7 @@
 import requests, pandas as pd, numpy as np
 from datetime import datetime, timedelta
 import os
+import sys
 
 # ---------------------------------------------------------
 # 0. Output 저장 경로 설정
@@ -15,12 +16,17 @@ TODAY = datetime.today().strftime("%Y-%m-%d")
 DAILY_FILE = f"{DAILY_PATH}/{TODAY}.xlsx"
 
 # ---------------------------------------------------------
-# 1. 환경변수에서 DART API KEY 읽기
+# 1. 환경변수 읽기 (+ 검증)
 # ---------------------------------------------------------
-DART_API_KEY = os.getenv("DART_API_KEY")
+DART_API_KEY = os.environ.get("DART_API_KEY", "").strip()
+
 if not DART_API_KEY:
-    print("❌ ERROR: DART_API_KEY 환경변수 없음")
-    exit()
+    print("❌ ERROR: DART_API_KEY 환경변수 없음 (Railway → Variables → DART_API_KEY 입력 필요)")
+    sys.exit(1)
+
+if len(DART_API_KEY) < 40:
+    print("❌ ERROR: DART_API_KEY 길이가 잘못됨:", DART_API_KEY)
+    sys.exit(1)
 
 # ---------------------------------------------------------
 # 2. HTS/섹터 매핑
@@ -41,7 +47,7 @@ TENBAGGER_SECTOR = {
 }
 
 # ---------------------------------------------------------
-# 3. 공시 점수
+# 3. 공시 점수표
 # ---------------------------------------------------------
 DISCLOSURE_SCORE = {
     "공급계약":40, "매출":40, "임상":40,
@@ -50,7 +56,7 @@ DISCLOSURE_SCORE = {
 }
 
 # ---------------------------------------------------------
-# 4. 공시 데이터 수집
+# 4. DART 공시 데이터 수집 (+ 오류 처리 강화)
 # ---------------------------------------------------------
 def get_disclosures(days=30):
     end = datetime.today()
@@ -63,14 +69,26 @@ def get_disclosures(days=30):
         "page_count": 200
     }
 
-    r = requests.get(url, params=params).json()
-    if r.get("status") != "000":
-        print("❌ DART ERROR:", r)
-        return pd.DataFrame()
+    r = requests.get(url, params=params)
 
-    return pd.DataFrame(r["list"])
+    try:
+        data = r.json()
+    except:
+        print("❌ ERROR: DART API JSON 오류:", r.text)
+        return None
+
+    if data.get("status") != "000":
+        print("❌ DART ERROR:", data)
+        return None
+
+    return pd.DataFrame(data["list"])
 
 df = get_disclosures()
+
+# DART 오류일 경우 바로 종료
+if df is None or df.empty:
+    print("❌ 공시 데이터가 없습니다. API 키 또는 날짜 범위 확인 필요.")
+    sys.exit(1)
 
 # ---------------------------------------------------------
 # 5. 점수 계산
@@ -83,6 +101,9 @@ def detect_sector(title, sector_map):
         if any(x in title for x in keys):
             return k
     return "기타"
+
+# Null 값 방지
+df["report_nm"] = df["report_nm"].fillna("")
 
 df["공시점수"] = df["report_nm"].apply(disclosure_score)
 df["HTS업종"] = df["report_nm"].apply(lambda x: detect_sector(x, HTS_SECTOR_MAP))
@@ -105,8 +126,10 @@ df["표시"] = df.apply(
 # 6. 그룹 분류
 # ---------------------------------------------------------
 def group(row):
-    if row["총점"]>=120: return "TOP_A"
-    if row["총점"]>=90: return "TOP_B"
+    if row["총점"] >= 120:
+        return "TOP_A"
+    if row["총점"] >= 90:
+        return "TOP_B"
     return "TOP_C"
 
 df["그룹"] = df.apply(group, axis=1)
@@ -115,8 +138,8 @@ df["그룹"] = df.apply(group, axis=1)
 # 7. DAILY 저장
 # ---------------------------------------------------------
 with pd.ExcelWriter(DAILY_FILE, engine="openpyxl") as w:
-    for g in ["TOP_A","TOP_B","TOP_C"]:
-        out = df[df["그룹"]==g].sort_values("총점", ascending=False)
+    for g in ["TOP_A", "TOP_B", "TOP_C"]:
+        out = df[df["그룹"] == g].sort_values("총점", ascending=False)
         if not out.empty:
             out.to_excel(w, sheet_name=g, index=False)
 
@@ -131,13 +154,13 @@ today_df["최근등장일"] = TODAY
 
 if os.path.exists(SUMMARY_PATH):
     old = pd.read_excel(SUMMARY_PATH)
-    merged = pd.merge(old, today_df, on="stock_code", how="outer", suffixes=("_old",""))
+    merged = pd.merge(old, today_df, on="stock_code", how="outer", suffixes=("_old", ""))
     merged["등장횟수"] = merged["등장횟수_old"].fillna(0) + merged["등장횟수"].fillna(0)
     merged["최초등장일"] = merged["최초등장일_old"].fillna(merged["최초등장일"])
     merged["최근등장일"] = TODAY
     summary = merged[[
-        "stock_code","corp_name","HTS업종","텐베거추정섹터",
-        "등장횟수","최초등장일","최근등장일","표시"
+        "stock_code", "corp_name", "HTS업종", "텐베거추정섹터",
+        "등장횟수", "최초등장일", "최근등장일", "표시"
     ]]
 else:
     summary = today_df
@@ -151,13 +174,17 @@ print("📊 SUMMARY:", SUMMARY_PATH)
 print("=================================================")
 
 # ---------------------------------------------------------
-# 9. Google Drive 업로드
+# 9. Google Drive 업로드 (서비스 계정)
 # ---------------------------------------------------------
 from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
 
+if not os.path.exists("service_account.json"):
+    print("❌ ERROR: service_account.json 파일을 찾을 수 없음 (Railway root에 업로드 필요)")
+    sys.exit(1)
+
 gauth = GoogleAuth()
-gauth.LoadServiceConfigFile('service_account.json')
+gauth.LoadServiceConfigFile("service_account.json")
 gauth.ServiceAuth()
 
 drive = GoogleDrive(gauth)
@@ -165,8 +192,8 @@ drive = GoogleDrive(gauth)
 PARENT_FOLDER_ID = "1P_ypbqa33HacbFjc1wZX8Vm3O3JGd7ci"
 
 file = drive.CreateFile({
-    'title': f"DAILY_{TODAY}.xlsx",
-    'parents': [{'id': PARENT_FOLDER_ID}]
+    "title": f"DAILY_{TODAY}.xlsx",
+    "parents": [{"id": PARENT_FOLDER_ID}]
 })
 
 file.SetContentFile(DAILY_FILE)
