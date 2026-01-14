@@ -17,7 +17,7 @@ DAILY_FILE = f"{DAILY_PATH}/{TODAY}.xlsx"
 # ---------------------------------------------------------
 # 1. 환경변수에서 DART API KEY 읽기
 # ---------------------------------------------------------
-DART_API_KEY = os.getenv("1e63717add99f7e948d6388e3209d55235cf3b27")
+DART_API_KEY = os.getenv("DART_API_KEY")
 if not DART_API_KEY:
     print("❌ ERROR: DART_API_KEY 환경변수 없음")
     exit()
