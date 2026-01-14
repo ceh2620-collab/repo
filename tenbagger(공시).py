@@ -151,3 +151,17 @@ print("✅ TENBAGGER TRACKER vNEXT 완료")
 print("📁 DAILY :", DAILY_FILE)
 print("📊 SUMMARY:", SUMMARY_PATH)
 print("=================================================")
+from pydrive2.auth import GoogleAuth
+from pydrive2.drive import GoogleDrive
+
+# 인증 설정
+gauth = GoogleAuth()
+gauth.LoadServiceConfigFile('service_account.json')
+gauth.ServiceAuth()
+drive = GoogleDrive(gauth)
+
+# 파일 업로드 예시
+file = drive.CreateFile({'title': 'DAILY_2024-01-14.xlsx',
+                         'parents': [{'id': '<Google Drive folder ID>'}]})
+file.SetContentFile(DAILY_FILE)
+file.Upload()
