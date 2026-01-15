@@ -1,4 +1,12 @@
-pydrive2
-pandas
-openpyxl
 requests
+pandas
+numpy
+PyJWT
+
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+google-api-python-client
+
+lxml
+openpyxl
