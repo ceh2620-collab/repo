@@ -1,85 +1,66 @@
+import os
+import sys
+import json
+import base64
 import requests
 import pandas as pd
 import numpy as np
-import os
-import sys
 from datetime import datetime, timedelta
-import json
-import base64
-import jwt
 
-# ---------------------------------------------------------
-# 0. 환경 변수 읽기
-# ---------------------------------------------------------
-DART_API_KEY = os.getenv("DART_API_KEY", "")
-SHEET_ID = os.getenv("GDRIVE_SHEET_ID", "")
-SERVICE_EMAIL = os.getenv("GDRIVE_SERVICE_EMAIL", "")
-PRIVATE_KEY = os.getenv("GDRIVE_PRIVATE_KEY", "")
+print("▶️ Script started:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
-if not all([DART_API_KEY, SHEET_ID, SERVICE_EMAIL, PRIVATE_KEY]):
-    print("❌ ERROR: 환경변수 누락")
+# ============================================================
+# 1. 환경변수 읽기 (Railway용)
+# ============================================================
+
+PORT = os.environ.get("PORT")
+DART_API_KEY = os.environ.get("DART_API_KEY")
+GDRIVE_JSON_BASE64 = os.environ.get("GDRIVE_JSON_BASE64")
+
+missing = []
+if not PORT: missing.append("PORT")
+if not DART_API_KEY: missing.append("DART_API_KEY")
+if not GDRIVE_JSON_BASE64: missing.append("GDRIVE_JSON_BASE64")
+
+if missing:
+    print("❌ ERROR: Missing environment variables:", missing)
     sys.exit(1)
 
+print("✅ Environment variables loaded")
+
+
+# ============================================================
+# 2. service_account.json 생성 (Base64 복원)
+# ============================================================
+
+try:
+    decoded = base64.b64decode(GDRIVE_JSON_BASE64)
+    with open("service_account.json", "wb") as f:
+        f.write(decoded)
+    print("✅ Google service_account.json created")
+except Exception as e:
+    print("❌ ERROR decoding GDRIVE_JSON_BASE64:", e)
+    sys.exit(1)
+
+
+# ============================================================
+# 3. 기본 경로 설정
+# ============================================================
+
+BASE_PATH = "/data"
+DAILY_DIR = f"{BASE_PATH}/daily"
+os.makedirs(DAILY_DIR, exist_ok=True)
+
 TODAY = datetime.today().strftime("%Y-%m-%d")
+DAILY_FILE = f"{DAILY_DIR}/{TODAY}.xlsx"
+SUMMARY_FILE = f"{BASE_PATH}/summary.xlsx"
 
-# ---------------------------------------------------------
-# 1. 구글 시트 API Access Token 생성
-# ---------------------------------------------------------
-def get_access_token():
-    auth_url = "https://oauth2.googleapis.com/token"
-    private_key = PRIVATE_KEY.replace("\\n", "\n")
 
-    payload = {
-        "iss": SERVICE_EMAIL,
-        "scope": "https://www.googleapis.com/auth/spreadsheets",
-        "aud": auth_url,
-        "exp": int((datetime.utcnow().timestamp())) + 3600,
-        "iat": int((datetime.utcnow().timestamp()))
-    }
+# ============================================================
+# 4. DART 공시 수집
+# ============================================================
 
-    signed_jwt = jwt.encode(payload, private_key, algorithm="RS256")
-
-    data = {
-        "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-        "assertion": signed_jwt
-    }
-
-    r = requests.post(auth_url, data=data)
-    token = r.json().get("access_token")
-
-    if not token:
-        print("❌ 구글 액세스 토큰 생성 오류:", r.text)
-        sys.exit(1)
-
-    return token
-
-ACCESS_TOKEN = get_access_token()
-
-# ---------------------------------------------------------
-# 2. Google Sheet 업데이트 함수
-# ---------------------------------------------------------
-def write_to_sheet(sheet_range, values):
-    url = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/{sheet_range}?valueInputOption=RAW"
-
-    headers = {
-        "Authorization": f"Bearer {ACCESS_TOKEN}",
-        "Content-Type": "application/json"
-    }
-
-    body = {
-        "range": sheet_range,
-        "majorDimension": "ROWS",
-        "values": values
-    }
-
-    r = requests.put(url, headers=headers, json=body)
-    if r.status_code not in [200, 201]:
-        print("❌ Google Sheet 업데이트 오류:", r.text)
-
-# ---------------------------------------------------------
-# 3. DART 데이터 수집
-# ---------------------------------------------------------
-def get_disclosures(days=30):
+def get_dart_disclosures(days=30):
     end = datetime.today()
     start = end - timedelta(days=days)
 
@@ -91,64 +72,95 @@ def get_disclosures(days=30):
         "page_count": 200
     }
 
-    r = requests.get(url, params=params).json()
+    r = requests.get(url, params=params)
 
-    if r.get("status") != "000":
-        print("❌ DART API 오류:", r)
-        return pd.DataFrame()
+    try:
+        data = r.json()
+    except:
+        print("❌ DART JSON Error:", r.text)
+        return None
 
-    return pd.DataFrame(r["list"])
+    if data.get("status") != "000":
+        print("❌ DART API Error:", data)
+        return None
 
-df = get_disclosures()
+    return pd.DataFrame(data["list"])
 
-if df.empty:
-    print("❌ DART 데이터 없음")
+
+df = get_dart_disclosures()
+if df is None or df.empty:
+    print("❌ No DART data found")
     sys.exit(1)
 
-# ---------------------------------------------------------
-# 4. 점수 계산
-# ---------------------------------------------------------
+
+# ============================================================
+# 5. 점수 계산
+# ============================================================
+
 DISCLOSURE_SCORE = {
-    "공급계약":40, "매출":40, "임상":40,
-    "승인":40, "신규사업":30, "사업목적":30,
-    "MOU":10
+    "공급계약": 40, "매출": 40, "임상": 40,
+    "승인": 40, "신규사업": 30, "사업목적": 30,
+    "MOU": 10
 }
 
-def score_title(t):
-    return sum(v for k,v in DISCLOSURE_SCORE.items() if k in t)
+def score_text(t):
+    return sum(v for k, v in DISCLOSURE_SCORE.items() if k in t)
 
-df["공시점수"] = df["report_nm"].apply(score_title)
+SECTOR_MAP = {
+    "AI": ["AI", "인공지능", "반도체"],
+    "바이오": ["임상", "신약"],
+    "전력": ["전력", "인프라"],
+    "우주": ["우주", "위성", "발사체"],
+}
 
-# ---------------------------------------------------------
-# 5. Grouping
-# ---------------------------------------------------------
-def group(row):
-    if row["공시점수"] >= 120: return "TOP_A"
-    if row["공시점수"] >= 90: return "TOP_B"
-    return "TOP_C"
+def detect_sector(text):
+    for sector, keys in SECTOR_MAP.items():
+        if any(k in text for k in keys):
+            return sector
+    return "기타"
 
-df["그룹"] = df.apply(group, axis=1)
+df["report_nm"] = df["report_nm"].fillna("")
+df["공시점수"] = df["report_nm"].apply(score_text)
+df["섹터"] = df["report_nm"].apply(detect_sector)
+df["총점"] = df["공시점수"] + df["섹터"].apply(lambda x: 60 if x != "기타" else 20)
 
-# ---------------------------------------------------------
-# 6. Google Sheet 저장
-# ---------------------------------------------------------
 
-# HEADER
-headers = [["날짜", "종목코드", "종목명", "공시명", "점수", "그룹"]]
+# ============================================================
+# 6. DAILY 저장
+# ============================================================
 
-# DATA
-rows = [
-    [
-        TODAY,
-        row["stock_code"],
-        row["corp_name"],
-        row["report_nm"],
-        row["공시점수"],
-        row["그룹"]
-    ]
-    for _, row in df.iterrows()
-]
+df.to_excel(DAILY_FILE, index=False)
+print("📁 Daily saved:", DAILY_FILE)
 
-write_to_sheet("Daily!A1", headers + rows)
 
-print("📊 Google Sheet 업데이트 완료!")
+# ============================================================
+# 7. SUMMARY 업데이트
+# ============================================================
+
+summary_cols = ["stock_code", "corp_name", "섹터", "총점"]
+today_df = df[summary_cols].drop_duplicates("stock_code")
+today_df["stock_code"] = today_df["stock_code"].astype(str)
+today_df["등장횟수"] = 1
+today_df["최근등장일"] = TODAY
+
+if os.path.exists(SUMMARY_FILE):
+    old = pd.read_excel(SUMMARY_FILE)
+    old["stock_code"] = old["stock_code"].astype(str)
+
+    merged = pd.merge(old, today_df, on="stock_code", how="outer", suffixes=("_old", ""))
+    merged["등장횟수"] = merged["등장횟수_old"].fillna(0) + merged["등장횟수"].fillna(0)
+    merged["최근등장일"] = TODAY
+    merged["섹터"] = merged["섹터"].fillna(merged["섹터_old"])
+    merged["총점"] = merged["총점"].fillna(merged["총점_old"])
+
+    summary = merged[["stock_code", "corp_name", "섹터", "총점", "등장횟수", "최근등장일"]]
+else:
+    summary = today_df
+
+summary.to_excel(SUMMARY_FILE, index=False)
+print("📊 Summary saved:", SUMMARY_FILE)
+
+
+print("====================================================")
+print("🎉 TENBAGGER vFINAL — Completed OK")
+print("====================================================")
