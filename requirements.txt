@@ -1,4 +1,4 @@
+pydrive2
 pandas
-numpy
-requests
 openpyxl
+requests
