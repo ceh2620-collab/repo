@@ -1,41 +1,82 @@
 import requests
 import pandas as pd
+import numpy as np
 import os
 import sys
 from datetime import datetime, timedelta
+import jwt
 
-# ========== 환경변수 =============
+# ------------------------------
+# 1. 환경 변수 읽기
+# ------------------------------
 DART_API_KEY = os.getenv("DART_API_KEY", "")
-GSHEET_API_KEY = os.getenv("GSHEET_API_KEY", "")
 SHEET_ID = os.getenv("GDRIVE_SHEET_ID", "")
+SERVICE_EMAIL = os.getenv("GDRIVE_SERVICE_EMAIL", "")
+PRIVATE_KEY = os.getenv("GDRIVE_PRIVATE_KEY", "")
 
-if not all([DART_API_KEY, GSHEET_API_KEY, SHEET_ID]):
+if not all([DART_API_KEY, SHEET_ID, SERVICE_EMAIL, PRIVATE_KEY]):
     print("❌ ERROR: 환경변수 누락")
     sys.exit(1)
 
 TODAY = datetime.today().strftime("%Y-%m-%d")
 
-# ========== Google Sheet 업데이트 ==========
-def write_to_sheet(range_name, values):
-    url = (
-        f"https://sheets.googleapis.com/v4/spreadsheets/"
-        f"{SHEET_ID}/values/{range_name}"
-        f"?valueInputOption=RAW&key={GSHEET_API_KEY}"
-    )
+# ------------------------------
+# 2. Access Token 생성 (Service Account)
+# ------------------------------
+def get_access_token():
+    auth_url = "https://oauth2.googleapis.com/token"
+    pk = PRIVATE_KEY.replace("\\n", "\n")
 
-    body = {
-        "range": range_name,
-        "majorDimension": "ROWS",
-        "values": values,
+    payload = {
+        "iss": SERVICE_EMAIL,
+        "scope": "https://www.googleapis.com/auth/spreadsheets",
+        "aud": auth_url,
+        "exp": int(datetime.utcnow().timestamp()) + 3600,
+        "iat": int(datetime.utcnow().timestamp())
     }
 
-    r = requests.put(url, json=body)
-    if r.status_code not in [200, 201]:
-        print("❌ Google Sheet 오류:", r.text)
-    else:
-        print("✅ Google Sheet 업데이트 완료")
+    signed = jwt.encode(payload, pk, algorithm="RS256")
 
-# ========== DART 데이터 수집 ==========
+    data = {
+        "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        "assertion": signed
+    }
+
+    r = requests.post(auth_url, data=data)
+    token = r.json().get("access_token")
+
+    if not token:
+        print("❌ Google OAuth 실패:", r.text)
+        sys.exit(1)
+
+    return token
+
+ACCESS_TOKEN = get_access_token()
+
+# ------------------------------
+# 3. Google Sheets 업데이트 함수
+# ------------------------------
+def write_to_sheet(sheet_range, values):
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}/values/{sheet_range}?valueInputOption=RAW"
+
+    headers = {
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    body = {
+        "range": sheet_range,
+        "majorDimension": "ROWS",
+        "values": values
+    }
+
+    r = requests.put(url, headers=headers, json=body)
+    if r.status_code not in [200, 201]:
+        print("❌ Google Sheets 업데이트 실패:", r.text)
+
+# ------------------------------
+# 4. DART 공시 데이터
+# ------------------------------
 def get_disclosures(days=30):
     end = datetime.today()
     start = end - timedelta(days=days)
@@ -50,7 +91,7 @@ def get_disclosures(days=30):
 
     r = requests.get(url, params=params).json()
     if r.get("status") != "000":
-        print("❌ DART 오류:", r)
+        print("❌ DART API 오류:", r)
         return pd.DataFrame()
 
     return pd.DataFrame(r["list"])
@@ -58,29 +99,31 @@ def get_disclosures(days=30):
 df = get_disclosures()
 
 if df.empty:
-    print("❌ 공시 없음")
+    print("❌ DART 데이터 없음")
     sys.exit(1)
 
-# ========== 점수 계산 ==========
-DISCLOSURE_SCORE = {
-    "공급계약":40, "매출":40, "임상":40,
-    "승인":40, "신규사업":30, "사업목적":30,
-    "MOU":10
-}
+# ------------------------------
+# 5. 점수 계산
+# ------------------------------
+def score_title(t):
+    score_table = {
+        "공급계약":40, "매출":40, "임상":40,
+        "승인":40, "신규사업":30, "사업목적":30,
+        "MOU":10
+    }
+    return sum(v for k,v in score_table.items() if k in t)
 
-df["공시점수"] = df["report_nm"].apply(
-    lambda t: sum(v for k,v in DISCLOSURE_SCORE.items() if k in t)
-)
+df["공시점수"] = df["report_nm"].apply(score_title)
 
-df["그룹"] = df["공시점수"].apply(
-    lambda s: "TOP_A" if s >= 120 else "TOP_B" if s >= 90 else "TOP_C"
-)
-
-# ========== Google Sheet 저장 ==========
-header = [["날짜","종목코드","종목명","공시명","점수","그룹"]]
+# ------------------------------
+# 6. Google Sheet 업로드
+# ------------------------------
+header = [["날짜", "종목코드", "종목명", "공시명", "점수"]]
 rows = [
-    [TODAY, r.stock_code, r.corp_name, r.report_nm, r["공시점수"], r["그룹"]]
-    for _, r in df.iterrows()
+    [TODAY, row["stock_code"], row["corp_name"], row["report_nm"], row["공시점수"]]
+    for _, row in df.iterrows()
 ]
 
 write_to_sheet("Daily!A1", header + rows)
+
+print("✅ Google Sheet 업데이트 완료!")
